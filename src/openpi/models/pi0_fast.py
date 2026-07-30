@@ -130,6 +130,15 @@ class Pi0FASTConfig(_model.BaseModelConfig):
             return nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*lora.*")))
         return nnx.Nothing
 
+    def get_freeze_filter_with_frozen_img_encoder(self) -> nnx.filterlib.Filter:
+        """Freeze SigLIP while leaving the full-size language model trainable."""
+        if "lora" in self.paligemma_variant:
+            return nnx.Any(
+                nnx.All(nnx_utils.PathRegex(".*llm.*"), nnx.Not(nnx_utils.PathRegex(".*lora.*"))),
+                nnx_utils.PathRegex(".*img.*"),
+            )
+        return nnx.All(nnx_utils.PathRegex(".*img.*"), nnx.Not(nnx_utils.PathRegex(".*llm.*")))
+
 
 class Pi0FAST(_model.BaseModel):
     def __init__(self, config: Pi0FASTConfig, rngs: nnx.Rngs):

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
@@ -9,7 +8,6 @@ from typing import Protocol
 from etils import epath
 import jax
 import orbax.checkpoint as ocp
-import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
@@ -121,12 +119,21 @@ class Callback(Protocol):
 class CallbackHandler(ocp.AsyncCheckpointHandler):
     """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
 
+    def __init__(self):
+        # Orbax 0.11.1 (used by the cluster environment) predates
+        # CommitFutureAwaitingContractedSignals. A standard concurrent future
+        # is accepted by both that release and newer Orbax releases.
+        self._executor = futures.ThreadPoolExecutor(max_workers=1)
+
+    def close(self):
+        self._executor.shutdown()
+
     def save(self, directory: epath.Path, args: CallbackSave):
         if jax.process_index() == 0:
             args.callback(directory)
 
     async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:
-        return [future.CommitFutureAwaitingContractedSignals(asyncio.to_thread(self.save, directory, args))]
+        return [self._executor.submit(self.save, directory, args)]
 
     def restore(self, *args, **kwargs):
         raise NotImplementedError("CallbackHandler does not support restore")

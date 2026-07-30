@@ -97,6 +97,10 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Optional local LIBERO corpus metadata. When set, the torch data loader
+    # reads query demonstrations directly from the original HDF5 files.
+    libero_corpus_dir: str | None = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -352,6 +356,40 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoHdf5DataConfig(DataConfigFactory):
+    """Native pi0-FAST transforms for a manifest-split local LIBERO corpus."""
+
+    corpus_dir: str = tyro.MISSING
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            libero_corpus_dir=self.corpus_dir,
         )
 
 
@@ -717,6 +755,36 @@ _CONFIGS = [
         # Note that we load the pi0-FAST base model checkpoint here.
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi0_fast_libero100_seed123",
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=10, max_token_len=180),
+        data=LiberoHdf5DataConfig(
+            repo_id="libero100_seed123_70_30",
+            corpus_dir="../../data/processed/ricl_libero100_70_30",
+            assets=AssetsConfig(asset_id="libero100_seed123_70_30"),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=16,
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=7,
+            action_horizon=10,
+            max_token_len=180,
+        ).get_freeze_filter_with_frozen_img_encoder(),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        # These checkpoints include optimizer state and are about 27 GB each.
+        # Save every 1k steps for recovery, but retain only the latest one.
+        keep_period=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
     ),
     TrainConfig(
         name="pi0_fast_libero_low_mem_finetune",

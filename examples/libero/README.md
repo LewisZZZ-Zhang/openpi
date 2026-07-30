@@ -61,6 +61,32 @@ Terminal window 2:
 uv run scripts/serve_policy.py --env LIBERO
 ```
 
+## Seed-123 LIBERO-100 native pi0-FAST baseline
+
+The `pi0_fast_libero100_seed123` config trains on the same 70 tasks and 40
+query demonstrations per task as the RICL experiment. It reads the original
+LIBERO HDF5 files through the shared corpus metadata, but does not load
+retrieval embeddings, neighbours, or context demonstrations.
+
+From the VFE repository root, use the unified Slurm launcher:
+
+```bash
+# One H200 allocation; train first, then evaluate 30 unseen tasks x 50 rollouts.
+MODE=train_eval EXP_NAME=libero100_pi0_fast_seed123 OVERWRITE=1 \
+  bash shells/run_pi0_fast_libero100_h200.sh
+
+# Training or evaluation only.
+MODE=train EXP_NAME=libero100_pi0_fast_seed123 RESUME=1 \
+  bash shells/run_pi0_fast_libero100_h200.sh
+MODE=eval EXP_NAME=libero100_pi0_fast_seed123 EVAL_CHECKPOINT_STEP=10000 \
+  bash shells/run_pi0_fast_libero100_h200.sh
+```
+
+The launcher creates normalization statistics when they are missing, verifies
+them against the RICL statistics, and evaluates through one policy server plus
+four task-sharded LIBERO clients. The merged result is written to
+`outputs/pi0_fast_libero100/<experiment>/<step>/unseen50/metrics.json`.
+
 ## Results
 
 If you want to reproduce the following numbers, you can evaluate the checkpoint at `gs://openpi-assets/checkpoints/pi05_libero/`. This
