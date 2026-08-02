@@ -4,6 +4,7 @@ import abc
 from collections.abc import Sequence
 import dataclasses
 import difflib
+import json
 import logging
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
@@ -19,6 +20,7 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.icl_lerobot_policy as icl_lerobot_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -89,6 +91,12 @@ class DataConfig:
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
+
+    # Optional local LeRobot dataset directory and episode subset. When unset,
+    # LeRobot resolves the dataset from its standard cache or the Hub.
+    dataset_root: str | None = None
+    episodes: Sequence[int] | None = None
+    video_backend: str | None = None
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -360,6 +368,108 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotIclDataConfig(DataConfigFactory):
+    """Canonical local LeRobot v2.1 data used by the non-retrieval ICL baselines."""
+
+    dataset_root: str = "../../data/lerobot/adityx23/icl-dataset_clean_canonical_v21"
+    split_manifest: str | None = None
+    split: Literal["train", "context", "all"] = "train"
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        dataset_root = pathlib.Path(self.dataset_root).expanduser().resolve()
+        info_path = dataset_root / "meta" / "info.json"
+        if not info_path.is_file():
+            raise FileNotFoundError(f"Missing canonical ICL metadata: {info_path}")
+
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        if info.get("codebase_version") != "v2.1":
+            raise ValueError(
+                f"OpenPI ICL training requires canonical LeRobot v2.1, got "
+                f"{info.get('codebase_version')!r} at {info_path}"
+            )
+        expected_features = {
+            "observation.state": 14,
+            "action": 16,
+            "observation.images.base_0_rgb": None,
+            "observation.images.left_wrist_0_rgb": None,
+            "observation.images.right_wrist_0_rgb": None,
+        }
+        features = info.get("features", {})
+        for name, expected_dim in expected_features.items():
+            if name not in features:
+                raise ValueError(f"Canonical ICL dataset is missing feature {name!r}: {info_path}")
+            if expected_dim is not None and features[name].get("shape") != [expected_dim]:
+                raise ValueError(
+                    f"Canonical ICL feature {name!r} must have shape [{expected_dim}], "
+                    f"got {features[name].get('shape')}"
+                )
+
+        episodes: tuple[int, ...] | None = None
+        if self.split != "all":
+            manifest_path = (
+                pathlib.Path(self.split_manifest).expanduser().resolve()
+                if self.split_manifest is not None
+                else dataset_root / "meta" / "train_context_split.json"
+            )
+            if not manifest_path.is_file():
+                raise FileNotFoundError(f"Missing ICL train/context manifest: {manifest_path}")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            split_episodes: dict[str, tuple[int, ...]] = {}
+            total_episodes = int(info["total_episodes"])
+            for split_name in ("train", "context"):
+                manifest_key = f"{split_name}_output_episodes"
+                raw_episodes = manifest.get(manifest_key)
+                if not isinstance(raw_episodes, list) or not raw_episodes:
+                    raise ValueError(f"Manifest {manifest_path} has no non-empty {manifest_key!r}")
+                parsed = tuple(int(episode) for episode in raw_episodes)
+                if len(set(parsed)) != len(parsed) or min(parsed) < 0 or max(parsed) >= total_episodes:
+                    raise ValueError(f"Manifest {manifest_path} contains invalid {manifest_key!r}")
+                split_episodes[split_name] = parsed
+            overlap = set(split_episodes["train"]) & set(split_episodes["context"])
+            if overlap:
+                raise ValueError(f"Manifest {manifest_path} leaks {len(overlap)} episodes across train/context")
+            episodes = split_episodes[self.split]
+
+        repack_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "base_image": "observation.images.base_0_rgb",
+                        "left_wrist_image": "observation.images.left_wrist_0_rgb",
+                        "right_wrist_image": "observation.images.right_wrist_0_rgb",
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[icl_lerobot_policy.IclLeRobotInputs(model_type=model_config.model_type)],
+            outputs=[icl_lerobot_policy.IclLeRobotOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        if model_config.model_type == _model.ModelType.PI0_FAST:
+            model_transforms = dataclasses.replace(
+                model_transforms,
+                inputs=(icl_lerobot_policy.PadIclState(model_config.action_dim), *model_transforms.inputs),
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            dataset_root=str(dataset_root),
+            episodes=episodes,
+            video_backend="pyav",
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=("action",),
+            prompt_from_task=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LiberoHdf5DataConfig(DataConfigFactory):
     """Native pi0-FAST transforms for a manifest-split local LIBERO corpus."""
 
@@ -595,6 +705,23 @@ class TrainConfig:
 
 
 # Use `get_config` if you need to get a config by name in your code.
+def _icl_lerobot_data_config() -> LeRobotIclDataConfig:
+    return LeRobotIclDataConfig(
+        repo_id="adityx23/icl-dataset_clean-canonical-v21",
+        assets=AssetsConfig(assets_dir="assets/icl_dataset_clean", asset_id="train"),
+        base_config=DataConfig(prompt_from_task=True),
+    )
+
+
+def _icl_lr_schedule() -> _optimizer.CosineDecaySchedule:
+    return _optimizer.CosineDecaySchedule(
+        warmup_steps=2_000,
+        peak_lr=1e-4,
+        decay_steps=100_000,
+        decay_lr=1e-5,
+    )
+
+
 _CONFIGS = [
     #
     # Inference Aloha configs.
@@ -677,6 +804,49 @@ _CONFIGS = [
                 prompt_from_task=True,
             ),
         ),
+    ),
+    #
+    # Canonical local LeRobot ICL baselines. These deliberately share the same
+    # data, train/context split, horizon, schedule, and logging cadence.
+    #
+    TrainConfig(
+        name="pi0_icl",
+        model=pi0_config.Pi0Config(action_horizon=10),
+        data=_icl_lerobot_data_config(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=100_000,
+        batch_size=16,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=5_000,
+        lr_schedule=_icl_lr_schedule(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_fast_icl",
+        model=pi0_fast.Pi0FASTConfig(action_dim=16, action_horizon=10, max_token_len=250),
+        data=_icl_lerobot_data_config(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=100_000,
+        batch_size=16,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=5_000,
+        lr_schedule=_icl_lr_schedule(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_icl",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10),
+        data=_icl_lerobot_data_config(),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=100_000,
+        batch_size=16,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=5_000,
+        lr_schedule=_icl_lr_schedule(),
+        ema_decay=None,
     ),
     #
     # Fine-tuning Libero configs.

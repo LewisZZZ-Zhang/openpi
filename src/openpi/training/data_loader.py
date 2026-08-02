@@ -140,9 +140,12 @@ def create_torch_dataset(
     if data_config.libero_corpus_dir is not None:
         return LiberoManifestDataset(data_config.libero_corpus_dir, action_horizon=action_horizon)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=data_config.dataset_root,
+        episodes=list(data_config.episodes) if data_config.episodes is not None else None,
+        video_backend=data_config.video_backend,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
