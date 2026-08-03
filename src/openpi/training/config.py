@@ -371,7 +371,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 class LeRobotIclDataConfig(DataConfigFactory):
     """Canonical local LeRobot v2.1 data used by the non-retrieval ICL baselines."""
 
-    dataset_root: str = "../../data/lerobot/adityx23/icl-dataset_clean_canonical_v21"
+    dataset_root: str = "../../data/lerobot/adityx23/icl-dataset_clean_canonical_v21_224_gop10"
     split_manifest: str | None = None
     split: Literal["train", "context", "all"] = "train"
 

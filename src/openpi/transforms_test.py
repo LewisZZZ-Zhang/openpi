@@ -67,6 +67,14 @@ def test_make_bool_mask():
     assert _transforms.make_bool_mask(2, 0, 2) == (True, True, True, True)
 
 
+def test_resize_images_keeps_already_sized_array():
+    image = np.zeros((224, 224, 3), dtype=np.uint8)
+
+    transformed = _transforms.ResizeImages(224, 224)({"image": {"camera": image}})
+
+    assert transformed["image"]["camera"] is image
+
+
 def test_tokenize_prompt():
     tokenizer = _tokenizer.PaligemmaTokenizer(max_len=12)
     transform = _transforms.TokenizePrompt(tokenizer)

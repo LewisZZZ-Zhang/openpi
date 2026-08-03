@@ -187,7 +187,16 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        # The ICL video preprocessing path already stores 224x224 padded frames.
+        # Preserve those arrays directly instead of entering JAX once per image in
+        # every DataLoader worker. This is also an exact no-op for any other image
+        # that already has the requested spatial shape.
+        data["image"] = {
+            key: image
+            if tuple(image.shape[-3:-1]) == (self.height, self.width)
+            else image_tools.resize_with_pad(image, self.height, self.width)
+            for key, image in data["image"].items()
+        }
         return data
 
 
