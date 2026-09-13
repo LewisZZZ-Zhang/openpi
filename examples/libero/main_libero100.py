@@ -213,6 +213,7 @@ def eval_libero(args: Args) -> None:
 
             try:
                 for episode_index in range(args.num_trials_per_task):
+                    logging.info("Starting %s episode %d", task.name, episode_index)
                     env.reset()
                     obs = env.set_init_state(initial_states[episode_index])
                     action_plan: collections.deque[np.ndarray] = collections.deque()
@@ -280,6 +281,14 @@ def eval_libero(args: Args) -> None:
                             "steps": timestep,
                             "error": rollout_error,
                         }
+                    )
+                    logging.info(
+                        "Finished %s episode %d: success=%s steps=%d error=%s",
+                        task.name,
+                        episode_index,
+                        done,
+                        timestep,
+                        rollout_error,
                     )
                     if args.save_videos and replay_images:
                         video_name = (

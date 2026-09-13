@@ -5,6 +5,7 @@ from typing import Any
 
 import jax.numpy as jnp
 
+from openpi.models import pi0_victr
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
@@ -91,4 +92,25 @@ def create_trained_policy(
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
+    )
+
+
+def create_trained_libero_victr_policy(
+    train_config: _config.TrainConfig,
+    checkpoint_dir: pathlib.Path | str,
+    corpus_dir: str,
+    *,
+    progress_predictor: Any | None = None,
+) -> _policy.LiberoVictrPolicy:
+    """Load Pi0Victr and attach its online LIBERO retrieval bank."""
+    if not isinstance(train_config.model, pi0_victr.Pi0VictrConfig):
+        raise TypeError("A LIBERO VICTR policy requires Pi0VictrConfig")
+    policy = create_trained_policy(train_config, checkpoint_dir)
+    return _policy.LiberoVictrPolicy(
+        policy,
+        corpus_dir=corpus_dir,
+        num_context_chunks=train_config.model.num_context_chunks,
+        context_chunk_size=train_config.model.context_chunk_size,
+        context_frames_per_chunk=train_config.model.context_frames_per_chunk,
+        progress_predictor=progress_predictor,
     )

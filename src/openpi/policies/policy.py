@@ -15,6 +15,9 @@ from typing_extensions import override
 
 from openpi import transforms as _transforms
 from openpi.models import model as _model
+from openpi.policies.libero_victr_retrieval import LiberoVictrBank
+from openpi.policies.libero_victr_retrieval import embed_dino
+from openpi.policies.libero_victr_retrieval import load_dinov2
 from openpi.shared import array_typing as at
 from openpi.shared import nnx_utils
 
@@ -108,6 +111,84 @@ class Policy(BasePolicy):
     @property
     def metadata(self) -> dict[str, Any]:
         return self._metadata
+
+
+class LiberoVictrPolicy(BasePolicy):
+    """Add online DINO/progress retrieval before invoking a Pi0Victr policy."""
+
+    def __init__(
+        self,
+        policy: Policy,
+        *,
+        corpus_dir: str,
+        num_context_chunks: int,
+        context_chunk_size: int,
+        context_frames_per_chunk: int,
+        progress_predictor: Any | None = None,
+    ) -> None:
+        self._policy = policy
+        self._bank = LiberoVictrBank(corpus_dir)
+        self._num_context_chunks = num_context_chunks
+        self._context_chunk_size = context_chunk_size
+        self._context_frames_per_chunk = context_frames_per_chunk
+        self._progress_predictor = progress_predictor
+        self._dinov2 = load_dinov2() if self._bank.metric in {"vision", "vision_progress"} else None
+
+    @override
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        if "retrieval_task_id" not in obs:
+            raise KeyError("VICTR LIBERO rollout requires retrieval_task_id")
+        task_id = int(np.asarray(obs["retrieval_task_id"]).item())
+        query_embedding = None
+        query_progress = None
+        if self._dinov2 is not None:
+            query_image = obs.get("observation/image", obs.get("query_top_image"))
+            if query_image is None:
+                raise KeyError("VICTR rollout requires observation/image or query_top_image")
+            query_embedding = embed_dino(np.asarray(query_image), self._dinov2)[0]
+        if self._bank.metric in {"progress", "vision_progress"}:
+            if "query_progress" in obs:
+                query_progress = float(np.asarray(obs["query_progress"]).item())
+            elif self._progress_predictor is not None:
+                query_progress = float(self._progress_predictor.predict(obs, task_id))
+            else:
+                raise KeyError("Progress retrieval requires query_progress or a VFE progress predictor")
+            query_progress = float(np.clip(query_progress, 0.0, 1.0))
+        bank_indices = self._bank.retrieve(
+            task_id,
+            k=self._num_context_chunks,
+            query_embedding=query_embedding,
+            query_progress=query_progress,
+        )
+        context = self._bank.context(
+            task_id,
+            bank_indices,
+            chunk_size=self._context_chunk_size,
+            frames_per_chunk=self._context_frames_per_chunk,
+        )
+        runtime_keys = {"query_progress", "retrieval_task_id", "retrieval_episode_id", "retrieval_timestep"}
+        policy_obs = {
+            key: value for key, value in obs.items() if key not in runtime_keys and not key.startswith("vfe_")
+        }
+        # Accept both OpenPI's stock LIBERO request schema and VFE's richer
+        # main_ricl.py schema so the existing VFE history/metrics evaluator is reusable.
+        aliases = {
+            "query_top_image": "observation/image",
+            "query_wrist_image": "observation/wrist_image",
+            "query_state": "observation/state",
+            "query_prompt": "prompt",
+        }
+        for source, destination in aliases.items():
+            if source in policy_obs:
+                policy_obs[destination] = policy_obs.pop(source)
+        return self._policy.infer({**policy_obs, **context}, noise=noise)
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return {**self._policy.metadata, "retrieval_backend": self._bank.backend}
+
+    def close(self) -> None:
+        self._bank.close()
 
 
 class PolicyRecorder(_base_policy.BasePolicy):

@@ -1,10 +1,13 @@
 import dataclasses
+import functools
 
 import einops
 import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+from openpi.models import tokenizer as _tokenizer
+from openpi.shared import image_tools
 
 
 def make_libero_example() -> dict:
@@ -80,7 +83,66 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        for key in ("context_images", "context_image_masks", "context_tokens", "context_tokens_mask"):
+            if key in data:
+                inputs[key] = data[key]
+
         return inputs
+
+
+def _digitize_context(values: np.ndarray) -> np.ndarray:
+    values = np.clip(np.asarray(values), -1.0, 1.0)
+    return np.digitize(values, bins=np.linspace(-1.0, 1.0, 257)[:-1]) - 1
+
+
+def libero_context_text(prompt: str, state: np.ndarray, actions: np.ndarray) -> str:
+    """Match VIKTR's compact Task/State/Action chunk representation."""
+    state_text = " ".join(map(str, _digitize_context(state)))
+    actions = np.asarray(actions)
+    indices = np.linspace(0, len(actions) - 1, min(len(actions), 8)).round().astype(np.int64)
+    action_text = "; ".join(" ".join(map(str, row)) for row in _digitize_context(actions[indices]))
+    cleaned_prompt = prompt.strip().replace("_", " ").replace("\n", " ")
+    return f"Task: {cleaned_prompt}, State: {state_text}; Action: {action_text}"
+
+
+@functools.cache
+def _victr_context_tokenizer(max_length: int) -> _tokenizer.PaligemmaTokenizer:
+    return _tokenizer.PaligemmaTokenizer(max_len=max_length)
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoVictrInputs(transforms.DataTransformFn):
+    """Convert a retrieved LIBERO sample into Pi0Victr's fixed context tensors."""
+
+    model_type: _model.ModelType
+    context_text_max_length: int
+
+    def __call__(self, data: dict) -> dict:
+        result = LiberoInputs(self.model_type)(data)
+        images = np.asarray(data["retrieved_context_images"], dtype=np.uint8)
+        states = np.asarray(data["retrieved_context_states"], dtype=np.float32)
+        actions = np.asarray(data["retrieved_context_actions"], dtype=np.float32)
+        if images.ndim != 5:
+            raise ValueError(f"Expected retrieved context images [k,f,h,w,c], got {images.shape}")
+        if states.shape[0] != images.shape[0] or actions.shape[0] != images.shape[0]:
+            raise ValueError("Retrieved context image/state/action chunk counts do not align")
+
+        flat_images = images.reshape((-1, *images.shape[-3:]))
+        if flat_images.shape[1:3] != (224, 224):
+            flat_images = np.asarray(image_tools.resize_with_pad(flat_images, 224, 224))
+        context_images = flat_images.reshape((*images.shape[:2], 224, 224, 3))
+        tokenizer = _victr_context_tokenizer(self.context_text_max_length)
+        texts = [libero_context_text(str(data["prompt"]), states[i], actions[i]) for i in range(len(images))]
+        tokenized = [tokenizer.tokenize(text) for text in texts]
+        result.update(
+            {
+                "context_images": context_images,
+                "context_image_masks": np.ones(images.shape[:2], dtype=bool),
+                "context_tokens": np.stack([item[0] for item in tokenized]),
+                "context_tokens_mask": np.stack([item[1] for item in tokenized]),
+            }
+        )
+        return result
 
 
 @dataclasses.dataclass(frozen=True)

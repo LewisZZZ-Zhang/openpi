@@ -17,6 +17,7 @@ import tyro
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi0_victr as pi0_victr
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -504,6 +505,48 @@ class LiberoHdf5DataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LiberoVictrHdf5DataConfig(LiberoHdf5DataConfig):
+    """LIBERO HDF5 queries plus precomputed VICTR retrieval context."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if not isinstance(model_config, pi0_victr.Pi0VictrConfig):
+            raise TypeError("LiberoVictrHdf5DataConfig requires Pi0VictrConfig")
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/wrist_image": "wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                        "retrieved_context_images": "retrieved_context_images",
+                        "retrieved_context_states": "retrieved_context_states",
+                        "retrieved_context_actions": "retrieved_context_actions",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[
+                libero_policy.LiberoVictrInputs(
+                    model_type=model_config.model_type,
+                    context_text_max_length=model_config.context_text_max_length,
+                )
+            ],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            libero_corpus_dir=self.corpus_dir,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -957,6 +1000,34 @@ _CONFIGS = [
         ),
     ),
     TrainConfig(
+        name="pi05_libero100_seed123",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LiberoHdf5DataConfig(
+            repo_id="libero100_seed123_70_30",
+            corpus_dir="../../data/processed/ricl_libero100_70_30",
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_fast_libero100_seed123",
+                asset_id="libero100_seed123_70_30",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=None,
+    ),
+    TrainConfig(
         name="pi0_fast_libero_low_mem_finetune",
         # Here is an example of loading a pi0-FAST model for LoRA finetuning.
         # For setting action_dim, action_horizon, and max_token_len, see the comments above.
@@ -998,6 +1069,111 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_victr_libero100_dino",
+        model=pi0_victr.Pi0VictrConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            retrieval_metric="vision",
+        ),
+        data=LiberoVictrHdf5DataConfig(
+            repo_id="libero100_seed123_70_30",
+            corpus_dir="../../data/processed/victr_libero100_70_30_dino",
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_fast_libero100_seed123",
+                asset_id="libero100_seed123_70_30",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.VictrCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        # Match the plain Pi0.5 baseline: global batch 32 over two GPUs.
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=None,
+    ),
+    TrainConfig(
+        name="pi05_victr_libero100_progress",
+        model=pi0_victr.Pi0VictrConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            retrieval_metric="progress",
+        ),
+        data=LiberoVictrHdf5DataConfig(
+            repo_id="libero100_seed123_70_30",
+            # The existing progress-RICL corpus already contains the exact
+            # per-demo t/(T-1) neighbors Pi0Victr needs; context materialization
+            # is model-specific and happens in LiberoVictrDataset.
+            corpus_dir="../../data/processed/ricl_libero100_70_30_progress_gt",
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_fast_libero100_seed123",
+                asset_id="libero100_seed123_70_30",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.VictrCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        # Match the plain Pi0.5 baseline: global batch 32 over two GPUs.
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=None,
+    ),
+    TrainConfig(
+        name="pi05_victr_libero100_dino_progress",
+        model=pi0_victr.Pi0VictrConfig(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            retrieval_metric="vision_progress",
+        ),
+        data=LiberoVictrHdf5DataConfig(
+            repo_id="libero100_seed123_70_30",
+            corpus_dir="../../data/processed/victr_libero100_70_30_dino_progress",
+            assets=AssetsConfig(
+                assets_dir="assets/pi0_fast_libero100_seed123",
+                asset_id="libero100_seed123_70_30",
+            ),
+            base_config=DataConfig(prompt_from_task=False),
+        ),
+        weight_loader=weight_loaders.VictrCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=10_000,
+        # Match the plain Pi0.5 baseline: global batch 32 over two GPUs.
+        batch_size=32,
+        num_workers=8,
+        fsdp_devices=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=10_000,
+            decay_lr=2.5e-6,
+        ),
+        ema_decay=None,
+        log_interval=10,
+        save_interval=1_000,
+        keep_period=None,
     ),
     #
     # Fine-tuning Aloha configs.

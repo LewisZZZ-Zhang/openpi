@@ -11,10 +11,12 @@ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+from openpi.models import pi0_victr
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 from openpi.training.libero_manifest_dataset import LiberoManifestDataset
+from openpi.training.libero_manifest_dataset import LiberoVictrDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -138,6 +140,15 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
     if data_config.libero_corpus_dir is not None:
+        if isinstance(model_config, pi0_victr.Pi0VictrConfig):
+            return LiberoVictrDataset(
+                data_config.libero_corpus_dir,
+                action_horizon=action_horizon,
+                num_context_chunks=model_config.num_context_chunks,
+                context_chunk_size=model_config.context_chunk_size,
+                context_frames_per_chunk=model_config.context_frames_per_chunk,
+                retrieval_metric=model_config.retrieval_metric,
+            )
         return LiberoManifestDataset(data_config.libero_corpus_dir, action_horizon=action_horizon)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=data_config.dataset_root)

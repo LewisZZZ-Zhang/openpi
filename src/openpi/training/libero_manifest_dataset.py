@@ -62,7 +62,7 @@ class LiberoManifestDataset:
         if not metadata_path.is_file():
             raise FileNotFoundError(f"LIBERO corpus metadata was not found at {metadata_path}")
         self.metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if self.metadata.get("format_version") != 1:
+        if self.metadata.get("format_version") not in (1, 2, 3):
             raise ValueError(f"Unsupported LIBERO corpus format: {self.metadata.get('format_version')!r}")
         if action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
@@ -137,9 +137,7 @@ class LiberoManifestDataset:
         return {
             "image": flip_libero_image(obs["agentview_rgb"][step_idx]),
             "wrist_image": flip_libero_image(obs["eye_in_hand_rgb"][step_idx]),
-            "state": np.concatenate((obs["ee_states"][step_idx], obs["gripper_states"][step_idx])).astype(
-                np.float32
-            ),
+            "state": np.concatenate((obs["ee_states"][step_idx], obs["gripper_states"][step_idx])).astype(np.float32),
             "actions": libero_action_chunk(actions, step_idx, self.action_horizon),
             "prompt": episode.prompt,
         }
@@ -165,6 +163,111 @@ class LiberoManifestDataset:
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
             self.close()
+
+
+class LiberoVictrDataset(LiberoManifestDataset):
+    """LIBERO queries augmented with precomputed VICTR retrieval context."""
+
+    def __init__(
+        self,
+        corpus_dir: str | PathLike[str],
+        *,
+        action_horizon: int,
+        num_context_chunks: int,
+        context_chunk_size: int,
+        context_frames_per_chunk: int,
+        retrieval_metric: str,
+    ) -> None:
+        super().__init__(corpus_dir, action_horizon=action_horizon)
+        corpus_backend = str(self.metadata.get("retrieval_backend", "dino"))
+        expected_backend = {
+            "vision": "dino",
+            "progress": "progress",
+            "vision_progress": "dino_progress",
+        }.get(retrieval_metric)
+        if corpus_backend != expected_backend:
+            raise ValueError(
+                f"Model retrieval metric {retrieval_metric!r} requires a {expected_backend!r} corpus, "
+                f"found {corpus_backend!r}"
+            )
+        corpus_k = int(self.metadata["num_retrieved"])
+        if num_context_chunks != corpus_k:
+            raise ValueError(f"Model requests {num_context_chunks} chunks, corpus contains {corpus_k}")
+        self.num_context_chunks = num_context_chunks
+        self.context_chunk_size = context_chunk_size
+        self.context_frames_per_chunk = context_frames_per_chunk
+        self._tasks = {int(task["task_id"]): task for task in self.metadata["tasks"]}
+        self._neighbors: dict[str, np.ndarray] = {}
+        self._refs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    def __getitem__(self, index: SupportsIndex) -> dict[str, object]:
+        sample_index = index.__index__()
+        if sample_index < 0:
+            sample_index += len(self)
+        if not 0 <= sample_index < len(self):
+            raise IndexError(sample_index)
+        episode_index = bisect.bisect_right(self._episode_ends, sample_index)
+        episode_start = 0 if episode_index == 0 else self._episode_ends[episode_index - 1]
+        step_idx = sample_index - episode_start
+        episode = self._episodes[episode_index]
+        task = self._tasks[episode.task_id]
+        neighbors_dir = task.get("neighbors_dir")
+        if neighbors_dir is None:
+            raise ValueError(f"Training task {episode.task_id} has no precomputed VICTR neighbors")
+        neighbors_path = str(self.root / neighbors_dir / f"{episode.demo_id}.npz")
+        if neighbors_path not in self._neighbors:
+            with np.load(neighbors_path, allow_pickle=False) as payload:
+                self._neighbors[neighbors_path] = np.asarray(payload["retrieved_bank_indices"], dtype=np.int32)
+        bank_indices = self._neighbors[neighbors_path][step_idx]
+        if bank_indices.shape != (self.num_context_chunks,):
+            raise ValueError(f"Unexpected VICTR neighbor shape: {bank_indices.shape}")
+
+        if episode.task_id not in self._refs:
+            with np.load(self.root / task["context_refs_path"], allow_pickle=False) as payload:
+                self._refs[episode.task_id] = (
+                    np.asarray(payload["demo_indices"], dtype=np.int32),
+                    np.asarray(payload["step_indices"], dtype=np.int32),
+                )
+        demo_indices, context_steps = self._refs[episode.task_id]
+        selected_demos = demo_indices[bank_indices]
+        if len(np.unique(selected_demos)) != len(selected_demos):
+            raise ValueError("VICTR retrieval must select at most one chunk per context demonstration")
+
+        h5_file = self._h5(episode.source_hdf5)
+        context_images, context_states, context_actions = [], [], []
+        # Retrieval files are nearest-to-farthest. VICTR encodes context in the
+        # reverse order so the query attends causally through increasingly relevant chunks.
+        for bank_index in reversed(bank_indices.tolist()):
+            demo_id = str(task["context_demo_ids"][int(demo_indices[bank_index])])
+            context_step = int(context_steps[bank_index])
+            prefix = f"data/{demo_id}"
+            obs = h5_file[f"{prefix}/obs"]
+            demo_actions = np.asarray(h5_file[f"{prefix}/actions"][:], dtype=np.float32)
+            chunk_end = min(context_step + self.context_chunk_size, len(demo_actions))
+            frame_indices = (
+                np.linspace(
+                    context_step,
+                    max(context_step, chunk_end - 1),
+                    self.context_frames_per_chunk,
+                )
+                .round()
+                .astype(np.int64)
+            )
+            context_images.append(np.stack([flip_libero_image(obs["agentview_rgb"][frame]) for frame in frame_indices]))
+            context_states.append(
+                np.concatenate((obs["ee_states"][context_step], obs["gripper_states"][context_step])).astype(np.float32)
+            )
+            context_actions.append(libero_action_chunk(demo_actions, context_step, self.context_chunk_size))
+
+        result = super().__getitem__(sample_index)
+        result.update(
+            {
+                "retrieved_context_images": np.stack(context_images),
+                "retrieved_context_states": np.stack(context_states),
+                "retrieved_context_actions": np.stack(context_actions),
+            }
+        )
+        return result
 
 
 def iter_training_trajectories(
