@@ -14,6 +14,8 @@ from typing import SupportsIndex
 import h5py
 import numpy as np
 
+from openpi.policies.libero_victr_retrieval import LiberoVictrBank
+
 
 def flip_libero_image(image: np.ndarray) -> np.ndarray:
     """Rotate a raw LIBERO image by 180 degrees to match online evaluation."""
@@ -177,6 +179,9 @@ class LiberoVictrDataset(LiberoManifestDataset):
         context_chunk_size: int,
         context_frames_per_chunk: int,
         retrieval_metric: str,
+        context_camera_keys: tuple[str, ...] = ("agentview_rgb", "eye_in_hand_rgb"),
+        use_action_interpolation: bool = False,
+        lamda: float = 3.0,
     ) -> None:
         super().__init__(corpus_dir, action_horizon=action_horizon)
         corpus_backend = str(self.metadata.get("retrieval_backend", "dino"))
@@ -191,11 +196,17 @@ class LiberoVictrDataset(LiberoManifestDataset):
                 f"found {corpus_backend!r}"
             )
         corpus_k = int(self.metadata["num_retrieved"])
-        if num_context_chunks != corpus_k:
+        if not 1 <= num_context_chunks <= corpus_k:
             raise ValueError(f"Model requests {num_context_chunks} chunks, corpus contains {corpus_k}")
+        self._corpus_k = corpus_k
         self.num_context_chunks = num_context_chunks
         self.context_chunk_size = context_chunk_size
         self.context_frames_per_chunk = context_frames_per_chunk
+        self.context_camera_keys = context_camera_keys
+        self.use_action_interpolation = use_action_interpolation
+        self.lamda = lamda
+        self._context_bank = LiberoVictrBank(corpus_dir)
+        self._scores: dict[str, np.ndarray] = {}
         self._tasks = {int(task["task_id"]): task for task in self.metadata["tasks"]}
         self._neighbors: dict[str, np.ndarray] = {}
         self._refs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -218,9 +229,17 @@ class LiberoVictrDataset(LiberoManifestDataset):
         if neighbors_path not in self._neighbors:
             with np.load(neighbors_path, allow_pickle=False) as payload:
                 self._neighbors[neighbors_path] = np.asarray(payload["retrieved_bank_indices"], dtype=np.int32)
+                if self.use_action_interpolation:
+                    if "retrieval_scores" not in payload:
+                        raise ValueError("RICL requires raw DINO retrieval_scores; rebuild the DINO VICTR corpus")
+                    self._scores[neighbors_path] = np.asarray(payload["retrieval_scores"], dtype=np.float32)
         bank_indices = self._neighbors[neighbors_path][step_idx]
-        if bank_indices.shape != (self.num_context_chunks,):
+        if bank_indices.shape != (self._corpus_k,):
             raise ValueError(f"Unexpected VICTR neighbor shape: {bank_indices.shape}")
+        # Stored neighbors are nearest first; context() reverses only the chosen
+        # subset. Reusing a larger top-k corpus must retain the nearest k, not
+        # the last k entries of the original corpus.
+        bank_indices = bank_indices[: self.num_context_chunks]
 
         if episode.task_id not in self._refs:
             with np.load(self.root / task["context_refs_path"], allow_pickle=False) as payload:
@@ -228,46 +247,31 @@ class LiberoVictrDataset(LiberoManifestDataset):
                     np.asarray(payload["demo_indices"], dtype=np.int32),
                     np.asarray(payload["step_indices"], dtype=np.int32),
                 )
-        demo_indices, context_steps = self._refs[episode.task_id]
+        demo_indices, _ = self._refs[episode.task_id]
         selected_demos = demo_indices[bank_indices]
         if len(np.unique(selected_demos)) != len(selected_demos):
             raise ValueError("VICTR retrieval must select at most one chunk per context demonstration")
 
-        h5_file = self._h5(episode.source_hdf5)
-        context_images, context_states, context_actions = [], [], []
-        # Retrieval files are nearest-to-farthest. VICTR encodes context in the
-        # reverse order so the query attends causally through increasingly relevant chunks.
-        for bank_index in reversed(bank_indices.tolist()):
-            demo_id = str(task["context_demo_ids"][int(demo_indices[bank_index])])
-            context_step = int(context_steps[bank_index])
-            prefix = f"data/{demo_id}"
-            obs = h5_file[f"{prefix}/obs"]
-            demo_actions = np.asarray(h5_file[f"{prefix}/actions"][:], dtype=np.float32)
-            chunk_end = min(context_step + self.context_chunk_size, len(demo_actions))
-            frame_indices = (
-                np.linspace(
-                    context_step,
-                    max(context_step, chunk_end - 1),
-                    self.context_frames_per_chunk,
-                )
-                .round()
-                .astype(np.int64)
-            )
-            context_images.append(np.stack([flip_libero_image(obs["agentview_rgb"][frame]) for frame in frame_indices]))
-            context_states.append(
-                np.concatenate((obs["ee_states"][context_step], obs["gripper_states"][context_step])).astype(np.float32)
-            )
-            context_actions.append(libero_action_chunk(demo_actions, context_step, self.context_chunk_size))
-
         result = super().__getitem__(sample_index)
         result.update(
-            {
-                "retrieved_context_images": np.stack(context_images),
-                "retrieved_context_states": np.stack(context_states),
-                "retrieved_context_actions": np.stack(context_actions),
-            }
+            self._context_bank.context(
+                episode.task_id,
+                bank_indices,
+                chunk_size=self.context_chunk_size,
+                frames_per_chunk=self.context_frames_per_chunk,
+                camera_keys=self.context_camera_keys,
+            )
         )
+        if self.use_action_interpolation:
+            result["exp_lamda_distance"] = self._context_bank.interpolation_weight(
+                episode.task_id, float(self._scores[neighbors_path][step_idx, 0]), self.lamda
+            )
         return result
+
+    def close(self) -> None:
+        super().close()
+        if hasattr(self, "_context_bank"):
+            self._context_bank.close()
 
 
 def iter_training_trajectories(

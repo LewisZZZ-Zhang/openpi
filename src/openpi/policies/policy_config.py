@@ -112,5 +112,9 @@ def create_trained_libero_victr_policy(
         num_context_chunks=train_config.model.num_context_chunks,
         context_chunk_size=train_config.model.context_chunk_size,
         context_frames_per_chunk=train_config.model.context_frames_per_chunk,
+        context_camera_keys=train_config.model.context_camera_keys,
+        use_action_interpolation=train_config.model.use_action_interpolation,
+        lamda=train_config.model.lamda,
+        retrieval_metric=train_config.model.retrieval_metric,
         progress_predictor=progress_predictor,
     )

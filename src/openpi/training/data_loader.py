@@ -148,6 +148,9 @@ def create_torch_dataset(
                 context_chunk_size=model_config.context_chunk_size,
                 context_frames_per_chunk=model_config.context_frames_per_chunk,
                 retrieval_metric=model_config.retrieval_metric,
+                context_camera_keys=model_config.context_camera_keys,
+                use_action_interpolation=model_config.use_action_interpolation,
+                lamda=model_config.lamda,
             )
         return LiberoManifestDataset(data_config.libero_corpus_dir, action_horizon=action_horizon)
 

@@ -113,6 +113,8 @@ class Observation(Generic[ArrayT]):
     context_image_masks: at.Bool[ArrayT, "*b k f"] | None = None
     context_tokens: at.Int[ArrayT, "*b k cl"] | None = None
     context_tokens_mask: at.Bool[ArrayT, "*b k cl"] | None = None
+    exp_lamda_distance: at.Float[ArrayT, "*b"] | None = None
+    nearest_action: at.Float[ArrayT, "*b ah ad"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -144,6 +146,8 @@ class Observation(Generic[ArrayT]):
             context_image_masks=data.get("context_image_masks"),
             context_tokens=data.get("context_tokens"),
             context_tokens_mask=data.get("context_tokens_mask"),
+            exp_lamda_distance=data.get("exp_lamda_distance"),
+            nearest_action=data.get("nearest_action"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -223,6 +227,12 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        context_images=observation.context_images,
+        context_image_masks=observation.context_image_masks,
+        context_tokens=observation.context_tokens,
+        context_tokens_mask=observation.context_tokens_mask,
+        exp_lamda_distance=observation.exp_lamda_distance,
+        nearest_action=observation.nearest_action,
     )
 
 

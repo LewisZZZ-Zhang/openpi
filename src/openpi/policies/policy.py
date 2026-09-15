@@ -125,12 +125,25 @@ class LiberoVictrPolicy(BasePolicy):
         context_chunk_size: int,
         context_frames_per_chunk: int,
         progress_predictor: Any | None = None,
+        context_camera_keys: tuple[str, ...] = ("agentview_rgb", "eye_in_hand_rgb"),
+        use_action_interpolation: bool = False,
+        lamda: float = 3.0,
+        retrieval_metric: str | None = None,
     ) -> None:
         self._policy = policy
         self._bank = LiberoVictrBank(corpus_dir)
+        if retrieval_metric is not None and self._bank.metric != retrieval_metric:
+            raise ValueError(f"Corpus metric {self._bank.metric} does not match trained model {retrieval_metric}")
+        if not 1 <= num_context_chunks <= int(self._bank.metadata.get("num_retrieved", num_context_chunks)):
+            raise ValueError("Corpus has fewer retrieved neighbors than the trained model requires")
         self._num_context_chunks = num_context_chunks
         self._context_chunk_size = context_chunk_size
         self._context_frames_per_chunk = context_frames_per_chunk
+        self._context_camera_keys = context_camera_keys
+        self._use_action_interpolation = use_action_interpolation
+        self._lamda = lamda
+        if use_action_interpolation and self._bank.metric != "vision":
+            raise ValueError("Continuous RICL interpolation requires DINO-only retrieval")
         self._progress_predictor = progress_predictor
         self._dinov2 = load_dinov2() if self._bank.metric in {"vision", "vision_progress"} else None
 
@@ -165,7 +178,12 @@ class LiberoVictrPolicy(BasePolicy):
             bank_indices,
             chunk_size=self._context_chunk_size,
             frames_per_chunk=self._context_frames_per_chunk,
+            camera_keys=self._context_camera_keys,
         )
+        if self._use_action_interpolation:
+            context["exp_lamda_distance"] = self._bank.online_interpolation_weight(
+                task_id, query_embedding, self._lamda
+            )
         runtime_keys = {"query_progress", "retrieval_task_id", "retrieval_episode_id", "retrieval_timestep"}
         policy_obs = {
             key: value for key, value in obs.items() if key not in runtime_keys and not key.startswith("vfe_")

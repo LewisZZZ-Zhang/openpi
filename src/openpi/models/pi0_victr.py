@@ -83,7 +83,7 @@ class Pi0Victr(pi0.Pi0):
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
         query_tokens, query_mask, query_ar = self.embed_prefix(obs)
         if obs.context_images is None:
-            return query_tokens, query_mask, query_ar
+            raise ValueError("Pi0Victr requires retrieved context; use Pi0Config for the no-context baseline")
         query_ar = query_ar.at[0].set(True)
         context_tokens, context_mask, context_ar = self.embed_context_chunks(obs)
         return (
@@ -103,6 +103,8 @@ class Pi0Victr(pi0.Pi0):
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        if self.victr_config.use_action_interpolation:
+            actions = self._blended_action_target(actions, observation)
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
@@ -122,6 +124,23 @@ class Pi0Victr(pi0.Pi0):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+    def _blended_action_target(self, actions, observation):
+        """Upstream 2851160: train the flow on a convex blend of true/neighbor actions."""
+        self._check_interpolation(observation)
+        weight = observation.exp_lamda_distance[..., None, None]
+        return (1 - weight) * actions + weight * observation.nearest_action
+
+    def _blend_velocity(self, velocity, x_t, time, observation):
+        self._check_interpolation(observation)
+        weight = observation.exp_lamda_distance[..., None, None]
+        return (1 - weight) * velocity + weight * (x_t - observation.nearest_action) / time
+
+    def _check_interpolation(self, observation):
+        if observation.exp_lamda_distance is None or observation.nearest_action is None:
+            raise ValueError("RICL continuous interpolation requires exp_lamda_distance and nearest_action")
+        if observation.nearest_action.shape[-2:] != (self.action_horizon, self.action_dim):
+            raise ValueError("nearest_action must match the model action horizon and padded action dimension")
 
     @override
     def sample_actions(
@@ -163,6 +182,8 @@ class Pi0Victr(pi0.Pi0):
                 adarms_cond=[None, adarms_cond],
             )
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            if self.victr_config.use_action_interpolation:
+                v_t = self._blend_velocity(v_t, x_t, time, observation)
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
@@ -182,9 +203,15 @@ def _gemma_width(config: pi0_config.Pi0Config) -> int:
 class Pi0VictrConfig(pi0_config.Pi0Config):
     num_context_chunks: int = 4
     context_chunk_size: int = 10
-    context_frames_per_chunk: int = 1
-    context_text_max_length: int = 64
+    context_frames_per_chunk: int = 2
+    context_camera_keys: tuple[str, ...] = ("agentview_rgb", "eye_in_hand_rgb")
+    context_text_max_length: int = 256
+    context_fast_tokenizer_path: str = "physical-intelligence/fast"
+    # LIBERO uses native 10-step actions; retain 7 DCT bins (upstream: 20/30).
+    context_action_keep_bins: int = 7
     retrieval_metric: Literal["vision", "progress", "vision_progress"] = "vision_progress"
+    use_action_interpolation: bool = False
+    lamda: float = 3.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -194,6 +221,18 @@ class Pi0VictrConfig(pi0_config.Pi0Config):
             raise ValueError("num_context_chunks must be positive")
         if self.context_chunk_size < 1 or self.context_frames_per_chunk < 1:
             raise ValueError("context chunk/frame counts must be positive")
+        if self.context_chunk_size != self.action_horizon:
+            raise ValueError("VICTR context must use the native model action horizon")
+        if len(self.context_camera_keys) != self.context_frames_per_chunk:
+            raise ValueError("One context image slot is required per camera")
+        if not 1 <= self.context_action_keep_bins <= self.action_horizon:
+            raise ValueError("context_action_keep_bins must be within the native action horizon")
+        if self.context_text_max_length < 1 or not self.context_fast_tokenizer_path:
+            raise ValueError("A positive token budget and FAST tokenizer are required")
+        if self.use_action_interpolation and self.retrieval_metric != "vision":
+            raise ValueError("Upstream continuous RICL interpolation requires retrieval_metric='vision'")
+        if not 0 <= self.lamda < float("inf"):
+            raise ValueError("lamda must be finite and non-negative")
 
     @override
     def create(self, rng: at.KeyArrayLike) -> Pi0Victr:
@@ -225,4 +264,13 @@ class Pi0VictrConfig(pi0_config.Pi0Config):
                     [batch_size, self.num_context_chunks, self.context_text_max_length], bool
                 ),
             )
+        if self.use_action_interpolation:
+            with at.disable_typechecking():
+                observation = dataclasses.replace(
+                    observation,
+                    exp_lamda_distance=jax.ShapeDtypeStruct([batch_size], jnp.float32),
+                    nearest_action=jax.ShapeDtypeStruct(
+                        [batch_size, self.action_horizon, self.action_dim], jnp.float32
+                    ),
+                )
         return observation, actions

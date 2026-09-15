@@ -3,6 +3,8 @@ import functools
 
 import einops
 import numpy as np
+from scipy.fft import dct
+from scipy.fft import idct
 
 from openpi import transforms
 from openpi.models import model as _model
@@ -90,32 +92,13 @@ class LiberoInputs(transforms.DataTransformFn):
         return inputs
 
 
-def _digitize_context(values: np.ndarray) -> np.ndarray:
-    values = np.clip(np.asarray(values), -1.0, 1.0)
-    return np.digitize(values, bins=np.linspace(-1.0, 1.0, 257)[:-1]) - 1
-
-
-def libero_context_text(prompt: str, state: np.ndarray, actions: np.ndarray) -> str:
-    """Match VIKTR's compact Task/State/Action chunk representation."""
-    state_text = " ".join(map(str, _digitize_context(state)))
-    actions = np.asarray(actions)
-    indices = np.linspace(0, len(actions) - 1, min(len(actions), 8)).round().astype(np.int64)
-    action_text = "; ".join(" ".join(map(str, row)) for row in _digitize_context(actions[indices]))
-    cleaned_prompt = prompt.strip().replace("_", " ").replace("\n", " ")
-    return f"Task: {cleaned_prompt}, State: {state_text}; Action: {action_text}"
-
-
-@functools.cache
-def _victr_context_tokenizer(max_length: int) -> _tokenizer.PaligemmaTokenizer:
-    return _tokenizer.PaligemmaTokenizer(max_len=max_length)
-
-
 @dataclasses.dataclass(frozen=True)
 class LiberoVictrInputs(transforms.DataTransformFn):
     """Convert a retrieved LIBERO sample into Pi0Victr's fixed context tensors."""
 
     model_type: _model.ModelType
     context_text_max_length: int
+    context_action_keep_bins: int = 7
 
     def __call__(self, data: dict) -> dict:
         result = LiberoInputs(self.model_type)(data)
@@ -131,17 +114,57 @@ class LiberoVictrInputs(transforms.DataTransformFn):
         if flat_images.shape[1:3] != (224, 224):
             flat_images = np.asarray(image_tools.resize_with_pad(flat_images, 224, 224))
         context_images = flat_images.reshape((*images.shape[:2], 224, 224, 3))
-        tokenizer = _victr_context_tokenizer(self.context_text_max_length)
-        texts = [libero_context_text(str(data["prompt"]), states[i], actions[i]) for i in range(len(images))]
-        tokenized = [tokenizer.tokenize(text) for text in texts]
+        # Apply upstream's native-window DCT low-pass before query normalization.
+        # The shared context encoder runs after Normalize, below.
+        if not 1 <= self.context_action_keep_bins <= actions.shape[-2]:
+            raise ValueError("Invalid context DCT budget for the action horizon")
+        coefficients = dct(actions, axis=-2, norm="ortho")
+        coefficients[..., self.context_action_keep_bins :, :] = 0
+        actions = idct(coefficients, axis=-2, norm="ortho").astype(np.float32)
         result.update(
             {
                 "context_images": context_images,
                 "context_image_masks": np.ones(images.shape[:2], dtype=bool),
-                "context_tokens": np.stack([item[0] for item in tokenized]),
-                "context_tokens_mask": np.stack([item[1] for item in tokenized]),
+                "retrieved_context_states": states,
+                "retrieved_context_actions": actions,
             }
         )
+        if "exp_lamda_distance" in data:
+            result["exp_lamda_distance"] = data["exp_lamda_distance"]
+        return result
+
+
+@functools.cache
+def _victr_fast_tokenizer(path: str, max_length: int) -> _tokenizer.FASTTokenizer:
+    return _tokenizer.FASTTokenizer(max_len=max_length, fast_tokenizer_path=path, strict=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class EncodeLiberoVictrContext(transforms.DataTransformFn):
+    """Shared train/rollout encoder; requires normalized neighbor states/actions."""
+
+    max_length: int
+    fast_tokenizer_path: str
+    action_dim: int
+    use_action_interpolation: bool = False
+
+    def __call__(self, data: dict) -> dict:
+        tokenizer = _victr_fast_tokenizer(self.fast_tokenizer_path, self.max_length)
+        states = data["retrieved_context_states"]
+        actions = data["retrieved_context_actions"]
+        tokens = [
+            tokenizer.tokenize(str(data["prompt"]), state, action)
+            for state, action in zip(states, actions, strict=True)
+        ]
+        result = dict(data)
+        result["context_tokens"] = np.stack([entry[0] for entry in tokens])
+        result["context_tokens_mask"] = np.stack([entry[1] for entry in tokens])
+        if self.use_action_interpolation:
+            if "exp_lamda_distance" not in data:
+                raise ValueError("Missing continuous RICL weight; validate retrieval preprocessing")
+            # Farthest-to-nearest order: the last action is the nearest neighbor.
+            # Blend continuous normalized actions, not FAST's clipped tokens.
+            result["nearest_action"] = transforms.pad_to_dim(actions[-1], self.action_dim)
         return result
 
 

@@ -16,6 +16,7 @@ import numpy as np
 from openpi.policies.libero_victr_retrieval import embed_dino
 from openpi.policies.libero_victr_retrieval import linear_progress
 from openpi.policies.libero_victr_retrieval import load_dinov2
+from openpi.policies.libero_victr_retrieval import max_pairwise_distance
 from openpi.policies.libero_victr_retrieval import retrieve_indices
 
 
@@ -114,31 +115,32 @@ def build(
                 if task_query_embeddings is not None:
                     task_query_embeddings.mkdir(exist_ok=True)
                 for demo_id in task["query_demo_ids"]:
-                    images = h5_file[f"data/{demo_id}/obs/agentview_rgb"][:]
+                    # Reuse cached DINO without decompressing every RGB frame.
+                    image_dataset = h5_file[f"data/{demo_id}/obs/agentview_rgb"]
+                    length = len(image_dataset)
                     query_embeddings = None
                     if task_query_embeddings is not None:
                         cache_path = task_query_embeddings / f"{demo_id}.npy"
                         if cache_path.exists():
                             query_embeddings = np.asarray(np.load(cache_path, mmap_mode="r"), dtype=np.float32)
-                            if query_embeddings.shape != (len(images), int(source["embedding_dim"])):
+                            if query_embeddings.shape != (length, int(source["embedding_dim"])):
                                 raise ValueError(
-                                    f"Unexpected cached query embedding shape at {cache_path}: "
-                                    f"{query_embeddings.shape}"
+                                    f"Unexpected cached query embedding shape at {cache_path}: {query_embeddings.shape}"
                                 )
                         else:
                             if model is None:
                                 model = load_dinov2()
                             query_embeddings = embed_dino(
-                                images,
+                                image_dataset[:],
                                 model,
                                 batch_size=embedding_batch_size,
                                 flip_libero=True,
                             )
                             np.save(cache_path, query_embeddings)
-                    query_progress = linear_progress(len(images))
-                    selected = np.empty((len(images), k), dtype=np.int32)
-                    scores = np.empty((len(images), k), dtype=np.float32)
-                    for frame in range(len(images)):
+                    query_progress = linear_progress(length)
+                    selected = np.empty((length, k), dtype=np.int32)
+                    scores = np.empty((length, k), dtype=np.float32)
+                    for frame in range(length):
                         selected[frame], scores[frame] = retrieve_indices(
                             metric=retrieval_metric,
                             context_demo_indices=demo_indices,
@@ -164,6 +166,9 @@ def build(
                 "neighbors_dir": neighbors_rel,
             }
         )
+        if retrieval_metric == "vision":
+            # Compute once during preprocessing, not once per data-loader worker.
+            task["max_pairwise_dino_distance"] = max_pairwise_distance(context_embeddings)
         output_tasks.append(task)
         print(f"[{position}/{len(source['tasks'])}] task={task_id} backend={backend}")
 

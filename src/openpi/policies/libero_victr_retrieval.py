@@ -157,6 +157,7 @@ class LiberoVictrBank:
         self.tasks = {int(task["task_id"]): task for task in self.metadata["tasks"]}
         self._banks: dict[int, dict[str, np.ndarray]] = {}
         self._h5_files: dict[str, h5py.File] = {}
+        self._max_distances: dict[int, float] = {}
 
     def _task_bank(self, task_id: int) -> dict[str, np.ndarray]:
         if task_id not in self._banks:
@@ -204,7 +205,10 @@ class LiberoVictrBank:
         *,
         chunk_size: int,
         frames_per_chunk: int,
+        camera_keys: tuple[str, ...] = ("agentview_rgb", "eye_in_hand_rgb"),
     ) -> dict[str, np.ndarray]:
+        if frames_per_chunk != len(camera_keys):
+            raise ValueError("VICTR context slots must match camera count")
         task = self.tasks[int(task_id)]
         bank = self._task_bank(int(task_id))
         source = str(Path(task["source_hdf5"]).expanduser().resolve())
@@ -219,8 +223,7 @@ class LiberoVictrBank:
             obs = h5_file[f"{prefix}/obs"]
             demo_actions = np.asarray(h5_file[f"{prefix}/actions"][:], dtype=np.float32)
             end = min(step + chunk_size, len(demo_actions))
-            frame_indices = np.linspace(step, max(step, end - 1), frames_per_chunk).round().astype(np.int64)
-            images.append(np.stack([np.ascontiguousarray(obs["agentview_rgb"][i][::-1, ::-1]) for i in frame_indices]))
+            images.append(np.stack([np.ascontiguousarray(obs[camera][step][::-1, ::-1]) for camera in camera_keys]))
             states.append(np.concatenate((obs["ee_states"][step], obs["gripper_states"][step])).astype(np.float32))
             chunk = demo_actions[step:end]
             if len(chunk) < chunk_size:
@@ -234,7 +237,46 @@ class LiberoVictrBank:
             "retrieved_context_actions": np.stack(actions),
         }
 
+    def interpolation_weight(self, task_id: int, top1_distance: float, lamda: float) -> np.ndarray:
+        """Upstream RICL: exp(-lamda * clip(d_top1 / max_pairwise_DINO, 0, 1))."""
+        if self.metric != "vision":
+            raise ValueError("Continuous RICL interpolation requires DINO-only retrieval")
+        if not np.isfinite(top1_distance) or top1_distance < 0 or not np.isfinite(lamda) or lamda < 0:
+            raise ValueError("RICL distance and lamda must be finite and non-negative")
+        if task_id not in self._max_distances:
+            scale = self.tasks[task_id].get("max_pairwise_dino_distance")
+            if scale is None:
+                scale = max_pairwise_distance(self._task_bank(task_id)["embeddings"])
+            if not np.isfinite(scale) or scale <= 0:
+                raise ValueError("Invalid precomputed DINO distance normalization")
+            self._max_distances[task_id] = float(scale)
+        normalized = np.clip(top1_distance / self._max_distances[task_id], 0.0, 1.0)
+        return np.asarray(np.exp(-lamda * normalized), dtype=np.float32)
+
+    def online_interpolation_weight(self, task_id: int, query_embedding: np.ndarray, lamda: float) -> np.ndarray:
+        distances = np.linalg.norm(self._task_bank(task_id)["embeddings"] - query_embedding[None], axis=1)
+        return self.interpolation_weight(task_id, float(distances.min()), lamda)
+
     def close(self) -> None:
         for h5_file in self._h5_files.values():
             h5_file.close()
         self._h5_files.clear()
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        state["_h5_files"] = {}
+        return state
+
+
+def max_pairwise_distance(embeddings: np.ndarray, block_size: int = 256) -> float:
+    """Exact upstream normalization with bounded memory instead of an N x N x D temporary."""
+    embeddings = np.asarray(embeddings, dtype=np.float64)
+    if embeddings.ndim != 2 or len(embeddings) == 0 or not np.isfinite(embeddings).all():
+        raise ValueError("Expected a nonempty finite DINO embedding bank")
+    norms = np.sum(embeddings**2, axis=1)
+    maximum = 0.0
+    for start in range(0, len(embeddings), block_size):
+        end = min(start + block_size, len(embeddings))
+        squared = norms[start:end, None] + norms[None, :] - 2 * embeddings[start:end] @ embeddings.T
+        maximum = max(maximum, float(squared.max()))
+    return max(float(np.sqrt(maximum)), 1e-6)

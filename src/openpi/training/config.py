@@ -524,6 +524,11 @@ class LiberoVictrHdf5DataConfig(LiberoHdf5DataConfig):
                         "retrieved_context_images": "retrieved_context_images",
                         "retrieved_context_states": "retrieved_context_states",
                         "retrieved_context_actions": "retrieved_context_actions",
+                        **(
+                            {"exp_lamda_distance": "exp_lamda_distance"}
+                            if model_config.use_action_interpolation
+                            else {}
+                        ),
                     }
                 )
             ]
@@ -533,15 +538,29 @@ class LiberoVictrHdf5DataConfig(LiberoHdf5DataConfig):
                 libero_policy.LiberoVictrInputs(
                     model_type=model_config.model_type,
                     context_text_max_length=model_config.context_text_max_length,
+                    context_action_keep_bins=model_config.context_action_keep_bins,
                 )
             ],
             outputs=[libero_policy.LiberoOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        model_transforms = dataclasses.replace(
+            model_transforms,
+            inputs=[
+                libero_policy.EncodeLiberoVictrContext(
+                    max_length=model_config.context_text_max_length,
+                    fast_tokenizer_path=model_config.context_fast_tokenizer_path,
+                    action_dim=model_config.action_dim,
+                    use_action_interpolation=model_config.use_action_interpolation,
+                ),
+                *model_transforms.inputs,
+            ],
         )
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
-            model_transforms=ModelTransformFactory()(model_config),
+            model_transforms=model_transforms,
             libero_corpus_dir=self.corpus_dir,
         )
 
@@ -1080,7 +1099,7 @@ _CONFIGS = [
         ),
         data=LiberoVictrHdf5DataConfig(
             repo_id="libero100_seed123_70_30",
-            corpus_dir="../../data/processed/victr_libero100_70_30_dino",
+            corpus_dir="../../data/processed/victr_libero100_70_30_dino_v2",
             assets=AssetsConfig(
                 assets_dir="assets/pi0_fast_libero100_seed123",
                 asset_id="libero100_seed123_70_30",
@@ -1383,6 +1402,75 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# Continuous RICL is a distinct experimental arm, not an implicit change to
+# DINO+Progress VICTR. Match upstream's vision-only interpolation requirement.
+_victr_dino = next(c for c in _CONFIGS if c.name == "pi05_victr_libero100_dino")
+_CONFIGS.append(
+    dataclasses.replace(
+        _victr_dino,
+        name="pi05_ricl_libero100_dino",
+        model=dataclasses.replace(_victr_dino.model, use_action_interpolation=True, lamda=3.0),
+    )
+)
+
+# Four-GPU k=1 arm: preserve samples seen at each schedule/save milestone.
+_ricl_dino = next(c for c in _CONFIGS if c.name == "pi05_ricl_libero100_dino")
+_CONFIGS.append(
+    dataclasses.replace(
+        _ricl_dino,
+        name="pi05_ricl_libero100_dino_k1_4gpu",
+        model=dataclasses.replace(_ricl_dino.model, num_context_chunks=1),
+        batch_size=64,
+        fsdp_devices=4,
+        num_train_steps=5_000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=5_000,
+            decay_lr=2.5e-6,
+        ),
+        save_interval=500,
+    )
+)
+
+# Paired k=1 DINO+Progress arm: keep every optimizer/schedule/batch setting
+# identical to four-GPU RICL, changing only the method and its retrieval corpus.
+_ricl_k1 = next(c for c in _CONFIGS if c.name == "pi05_ricl_libero100_dino_k1_4gpu")
+_victr_fused = next(c for c in _CONFIGS if c.name == "pi05_victr_libero100_dino_progress")
+_CONFIGS.append(
+    dataclasses.replace(
+        _ricl_k1,
+        name="pi05_victr_libero100_dino_progress_k1_4gpu",
+        model=dataclasses.replace(_victr_fused.model, num_context_chunks=1),
+        data=_victr_fused.data,
+    )
+)
+
+# Optional paired warm-start controls. Default configs still start from pi05_base
+# for the existing baseline comparison; these use the same trained baseline.
+_warmstart_params = "checkpoints/pi05_libero100_seed123/libero100_pi05_seed123_2gpu_bs32_10k/9999/params"
+for _source_name in ("pi05_libero100_seed123", "pi05_victr_libero100_dino_progress", "pi05_ricl_libero100_dino"):
+    _source = next(c for c in _CONFIGS if c.name == _source_name)
+    _loader = (
+        weight_loaders.VictrCheckpointWeightLoader
+        if isinstance(_source.model, pi0_victr.Pi0VictrConfig)
+        else weight_loaders.CheckpointWeightLoader
+    )
+    _CONFIGS.append(
+        dataclasses.replace(
+            _source,
+            name=f"{_source_name}_warmstart",
+            weight_loader=_loader(_warmstart_params),
+            lr_schedule=_optimizer.CosineDecaySchedule(
+                warmup_steps=1_000,
+                warmup_init_lr=2.5e-6,
+                peak_lr=1e-5,
+                decay_steps=10_000,
+                decay_lr=1e-6,
+            ),
+        )
+    )
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

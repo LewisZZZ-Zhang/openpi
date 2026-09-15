@@ -49,8 +49,11 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast", *, strict: bool = False
+    ):
         self._max_len = max_len
+        self._strict = strict
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -76,7 +79,8 @@ class FASTTokenizer:
 
         if actions is not None:
             # Tokenize actions with FAST tokenizer --> map to last tokens in PaliGemma vocab
-            action_tokens = self._fast_tokenizer(actions[None])[0]
+            # Upstream VICTR clips quantile outliers before FAST's DCT/character encoder.
+            action_tokens = self._fast_tokenizer(np.clip(actions[None], -1.0, 1.0))[0]
             action_tokens_in_pg = self._act_tokens_to_paligemma_tokens(action_tokens)
 
             # Convention: postfix contains 'Action:' followed by FAST tokens, followed by '|'
@@ -91,6 +95,11 @@ class FASTTokenizer:
         # Create output token sequence & masks
         # AR mask is 0 on prefix (bidirectional attention) and 1 on postfix (causal attention to all previous tokens)
         tokens = prefix_tokens + postfix_tokens
+        if self._strict and len(tokens) > self._max_len:
+            raise ValueError(
+                f"VICTR context requires {len(tokens)} tokens, budget={self._max_len}; "
+                "increase context_text_max_length and rerun the token-budget preflight. Refusing to truncate actions."
+            )
         token_mask = [True] * len(tokens)
         ar_mask = [0] * len(prefix_tokens) + [1] * len(postfix_tokens)
         loss_mask = [False] * len(prefix_tokens) + [True] * len(postfix_tokens)  # Loss on postfix only

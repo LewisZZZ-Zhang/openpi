@@ -127,12 +127,23 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        result = apply_tree(
             data,
             self.norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        # Retrieval neighbors must use exactly the query's checkpoint normalization.
+        normalize = self._normalize_quantile if self.use_quantiles else self._normalize
+        for context_key, query_key in (
+            ("retrieved_context_states", "state"),
+            ("retrieved_context_actions", "actions"),
+        ):
+            if context_key in data:
+                if query_key not in self.norm_stats:
+                    raise ValueError(f"Missing {query_key} normalization for VICTR context")
+                result[context_key] = normalize(data[context_key], self.norm_stats[query_key]).astype(np.float32)
+        return result
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
