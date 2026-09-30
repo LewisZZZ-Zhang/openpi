@@ -105,6 +105,25 @@ def test_k1_four_gpu_schedule_preserves_sample_milestones():
         assert getattr(new, field) == getattr(old, field)
 
 
+def test_no_interpolation_ablation_changes_only_model_switch():
+    from openpi.training.config import get_config
+
+    control = get_config("pi05_ricl_libero100_dino")
+    ablation = get_config("pi05_ricl_libero100_dino_no_action_interpolation")
+    for field in dataclasses.fields(control):
+        if field.name not in {"name", "model"}:
+            assert getattr(ablation, field.name) == getattr(control, field.name), field.name
+    assert ablation.model == dataclasses.replace(control.model, use_action_interpolation=False)
+    assert ablation.model.num_context_chunks == 4
+    assert ablation.model.retrieval_metric == "vision"
+    assert ablation.batch_size == 32
+    assert ablation.num_train_steps == 10_000
+    obs = ablation.model.fake_obs(batch_size=1)
+    assert obs.context_tokens is not None
+    assert obs.nearest_action is None
+    assert obs.exp_lamda_distance is None
+
+
 def test_k1_four_gpu_victr_matches_ricl_training_settings():
     from openpi.training.config import get_config
 

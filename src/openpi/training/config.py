@@ -1419,6 +1419,24 @@ _ricl_dino = next(c for c in _CONFIGS if c.name == "pi05_ricl_libero100_dino")
 _CONFIGS.append(
     dataclasses.replace(
         _ricl_dino,
+        name="pi05_ricl_libero100_dino_k1_no_action_interpolation",
+        model=dataclasses.replace(
+            _ricl_dino.model, num_context_chunks=1, use_action_interpolation=False
+        ),
+    )
+)
+# Paired ablation: retain the same retrieval/context and optimizer settings,
+# disabling BOTH target interpolation during training and velocity mixing at eval.
+_CONFIGS.append(
+    dataclasses.replace(
+        _ricl_dino,
+        name="pi05_ricl_libero100_dino_no_action_interpolation",
+        model=dataclasses.replace(_ricl_dino.model, use_action_interpolation=False),
+    )
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _ricl_dino,
         name="pi05_ricl_libero100_dino_k1_4gpu",
         model=dataclasses.replace(_ricl_dino.model, num_context_chunks=1),
         batch_size=64,
